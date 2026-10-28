@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include <algorithm>
 
 #include <imgui.h>
 
@@ -24,6 +25,7 @@ namespace {
 struct Vertex {
 	glm::vec3 position;
 	glm::vec3 color;
+	glm::vec3 normal;
 };
 
 constexpr int cone_segments = 32;
@@ -33,26 +35,30 @@ constexpr float cone_height = 1.0f;
 std::vector<Vertex> vertices;
 std::vector<uint32_t> indices;
 
+
+// Цвет вершины по её локальной позиции на окружности (доп. задание №5 из ЛР1)
+glm::vec3 proceduralColor(float x, float z) {
+	return { x / cone_radius * 0.5f + 0.5f,
+			 0.5f,
+			 z / cone_radius * 0.5f + 0.5f };
+}
+
+// Нормаль боковой поверхности в точке под углом angle:
+// перпендикулярна образующей -> (h*cos, r, h*sin), нормированная
+glm::vec3 sideNormal(float angle) {
+	return glm::normalize(glm::vec3(cone_height * std::cos(angle),
+									cone_radius,
+									cone_height * std::sin(angle)));
+}
+
 void generateCone() {
 	vertices.clear();
 	indices.clear();
 
 	const float half_height = cone_height * 0.5f;
 
-	// index 0: apex
-	vertices.push_back({
-		.position = { 0.0f, half_height, 0.0f },
-		.color = { 1.0f, 1.0f, 1.0f },
-	});
-
-	// index 1: base center
-	vertices.push_back({
-		.position = { 0.0f, -half_height, 0.0f },
-		.color = { 0.2f, 0.2f, 0.2f },
-	});
-
-	// indices 2 .. 2+cone_segments-1: base ring
-	const uint32_t base_ring_first_index = uint32_t(vertices.size());
+	// 1) кольцо основания для боковой поверхности (нормали смотрят наружу-вверх)
+	const uint32_t side_ring_first = uint32_t(vertices.size());
 	for (int i = 0; i < cone_segments; ++i) {
 		const float angle = (float(i) / float(cone_segments)) * 2.0f * float(M_PI);
 		const float x = std::cos(angle) * cone_radius;
@@ -60,30 +66,59 @@ void generateCone() {
 
 		vertices.push_back({
 			.position = { x, -half_height, z },
-			// procedural color based on local position (see доп. задание №5)
-			.color = { x / cone_radius * 0.5f + 0.5f,
-					   0.5f,
-					   z / cone_radius * 0.5f + 0.5f },
+			.color = proceduralColor(x, z),
+			.normal = sideNormal(angle),
 		});
 	}
 
-	constexpr uint32_t apex_index = 0;
-	constexpr uint32_t base_center_index = 1;
-
-	// side surface: triangle fan from the apex
+	// 2) вершина конуса: по копии на каждый сегмент, потому что у каждой
+	//    грани своя нормаль; берём нормаль в середине сегмента
+	const uint32_t apex_first = uint32_t(vertices.size());
 	for (int i = 0; i < cone_segments; ++i) {
-		const uint32_t curr = base_ring_first_index + uint32_t(i);
-		const uint32_t next = base_ring_first_index + uint32_t((i + 1) % cone_segments);
+		const float mid_angle = ((float(i) + 0.5f) / float(cone_segments)) * 2.0f * float(M_PI);
 
-		indices.push_back(apex_index);
+		vertices.push_back({
+			.position = { 0.0f, half_height, 0.0f },
+			.color = { 1.0f, 1.0f, 1.0f },
+			.normal = sideNormal(mid_angle),
+		});
+	}
+
+	// боковая поверхность: тот же порядок вершин, что в ЛР1
+	for (int i = 0; i < cone_segments; ++i) {
+		const uint32_t curr = side_ring_first + uint32_t(i);
+		const uint32_t next = side_ring_first + uint32_t((i + 1) % cone_segments);
+
+		indices.push_back(apex_first + uint32_t(i));
 		indices.push_back(curr);
 		indices.push_back(next);
 	}
 
-	// base cap: triangle fan from the base center (reverse winding vs. side)
+	// 3) дно: центр + своё кольцо вершин, нормаль везде вниз
+	const uint32_t base_center_index = uint32_t(vertices.size());
+	vertices.push_back({
+		.position = { 0.0f, -half_height, 0.0f },
+		.color = { 0.2f, 0.2f, 0.2f },
+		.normal = { 0.0f, -1.0f, 0.0f },
+	});
+
+	const uint32_t base_ring_first = uint32_t(vertices.size());
 	for (int i = 0; i < cone_segments; ++i) {
-		const uint32_t curr = base_ring_first_index + uint32_t(i);
-		const uint32_t next = base_ring_first_index + uint32_t((i + 1) % cone_segments);
+		const float angle = (float(i) / float(cone_segments)) * 2.0f * float(M_PI);
+		const float x = std::cos(angle) * cone_radius;
+		const float z = std::sin(angle) * cone_radius;
+
+		vertices.push_back({
+			.position = { x, -half_height, z },
+			.color = proceduralColor(x, z),
+			.normal = { 0.0f, -1.0f, 0.0f },
+		});
+	}
+
+	// дно: обратный порядок вершин, как в ЛР1
+	for (int i = 0; i < cone_segments; ++i) {
+		const uint32_t curr = base_ring_first + uint32_t(i);
+		const uint32_t next = base_ring_first + uint32_t((i + 1) % cone_segments);
 
 		indices.push_back(base_center_index);
 		indices.push_back(next);
@@ -91,9 +126,7 @@ void generateCone() {
 	}
 }
 
-// ------------------------------------------------------------------
 // GPU resources
-// ------------------------------------------------------------------
 
 VkBuffer vertex_buffer;
 VmaAllocation vertex_buffer_allocation;
@@ -195,9 +228,7 @@ bool createBuffer(VmaAllocator allocator, VkDeviceSize size, VkBufferUsageFlags 
 	return true;
 }
 
-// ------------------------------------------------------------------
 // UI-controlled state
-// ------------------------------------------------------------------
 
 bool use_perspective_projection = true;
 
@@ -219,6 +250,38 @@ float trajectory_radius = 1.0f;
 float trajectory_wave_amplitude = 0.3f;
 
 double last_frame_time = 0.0;
+
+// ЛР2: камера.
+// (lookAt из точки (2, 1.5, 2) в начало координат)
+const glm::vec3 default_camera_position = { 2.0f, 1.5f, 2.0f };
+constexpr float default_camera_yaw = 45.0f;    // поворот вокруг оси Y, градусы
+constexpr float default_camera_pitch = -27.9f; // наклон вверх/вниз, градусы
+
+glm::vec3 camera_position = default_camera_position;
+float camera_yaw = default_camera_yaw;
+float camera_pitch = default_camera_pitch;
+float camera_speed = 2.0f;
+
+// Матрица "модели" камеры: камера — такой же объект в мире.
+// Сначала поворот (yaw, потом pitch), потом перенос в позицию.
+// Камера смотрит вдоль своей локальной оси -Z.
+glm::mat4 cameraMatrix() {
+	glm::mat4 m(1.0f);
+	m = glm::translate(m, camera_position);
+	m = glm::rotate(m, glm::radians(camera_yaw), glm::vec3(0.0f, 1.0f, 0.0f));
+	m = glm::rotate(m, glm::radians(camera_pitch), glm::vec3(1.0f, 0.0f, 0.0f));
+	return m;
+}
+
+// Матрица вида — обратная к матрице камеры 
+// V = (T * Ry * Rx)^-1 = Rx^-1 * Ry^-1 * T^-1
+glm::mat4 viewMatrix() {
+	glm::mat4 v(1.0f);
+	v = glm::rotate(v, glm::radians(-camera_pitch), glm::vec3(1.0f, 0.0f, 0.0f));
+	v = glm::rotate(v, glm::radians(-camera_yaw), glm::vec3(0.0f, 1.0f, 0.0f));
+	v = glm::translate(v, -camera_position);
+	return v;
+}
 
 } // namespace
 
@@ -348,7 +411,7 @@ bool initialize() {
 		.inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
 	};
 
-	const VkVertexInputAttributeDescription vertex_attributes[] = {
+		const VkVertexInputAttributeDescription vertex_attributes[] = {
 		{
 			.location = 0,
 			.binding = 0,
@@ -360,6 +423,12 @@ bool initialize() {
 			.binding = 0,
 			.format = VK_FORMAT_R32G32B32_SFLOAT,
 			.offset = offsetof(Vertex, color),
+		},
+		{
+			.location = 2,
+			.binding = 0,
+			.format = VK_FORMAT_R32G32B32_SFLOAT,
+			.offset = offsetof(Vertex, normal),
 		},
 	};
 
@@ -488,6 +557,34 @@ void shutdown() {
 void update(double time) {
 	const double delta = (last_frame_time == 0.0) ? 0.0 : (time - last_frame_time);
 	last_frame_time = time;
+		// ЛР2: управление камерой мышью и клавиатурой
+	// (только когда курсор/клавиатура не заняты окном ImGui)
+	const ImGuiIO& io = ImGui::GetIO();
+
+	if (!io.WantCaptureMouse && ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+		camera_yaw -= io.MouseDelta.x * 0.15f;
+		camera_pitch -= io.MouseDelta.y * 0.15f;
+	}
+	camera_pitch = std::clamp(camera_pitch, -89.0f, 89.0f);
+
+	if (!io.WantCaptureKeyboard) {
+		const glm::mat4 cam = cameraMatrix();
+		const glm::vec3 forward = -glm::vec3(cam[2]); // камера смотрит вдоль -Z
+		const glm::vec3 right = glm::vec3(cam[0]);
+		const glm::vec3 up = { 0.0f, 1.0f, 0.0f };
+
+		glm::vec3 move(0.0f);
+		if (ImGui::IsKeyDown(ImGuiKey_W)) move += forward;
+		if (ImGui::IsKeyDown(ImGuiKey_S)) move -= forward;
+		if (ImGui::IsKeyDown(ImGuiKey_D)) move += right;
+		if (ImGui::IsKeyDown(ImGuiKey_A)) move -= right;
+		if (ImGui::IsKeyDown(ImGuiKey_E)) move += up;
+		if (ImGui::IsKeyDown(ImGuiKey_Q)) move -= up;
+
+		if (glm::length(move) > 0.0f) {
+			camera_position += glm::normalize(move) * camera_speed * float(delta);
+		}
+	}
 
 	if (animation_enabled && animation_playing) {
 		animation_time += float(delta) * animation_speed;
@@ -515,6 +612,18 @@ void update(double time) {
 	ImGui::EndDisabled();
 	ImGui::SliderFloat3("Rotation (deg)", object_rotation, -180.0f, 180.0f);
 	ImGui::SliderFloat3("Scale", object_scale, 0.1f, 3.0f);
+
+	ImGui::SeparatorText("Camera");
+	ImGui::TextDisabled("RMB + mouse: look, WASD/QE: move");
+	ImGui::DragFloat3("Cam position", &camera_position.x, 0.02f);
+	ImGui::SliderFloat("Yaw", &camera_yaw, -180.0f, 180.0f);
+	ImGui::SliderFloat("Pitch", &camera_pitch, -89.0f, 89.0f);
+	ImGui::SliderFloat("Cam speed", &camera_speed, 0.5f, 10.0f);
+	if (ImGui::Button("Reset camera")) {
+		camera_position = default_camera_position;
+		camera_yaw = default_camera_yaw;
+		camera_pitch = default_camera_pitch;
+	}
 
 	ImGui::SeparatorText("Animation");
 	ImGui::Checkbox("Enable trajectory", &animation_enabled);
@@ -599,10 +708,7 @@ void render(const graphics::internal::FrameData& fd) {
 	model = glm::rotate(model, glm::radians(object_rotation[2]), glm::vec3(0.0f, 0.0f, 1.0f));
 	model = glm::scale(model, glm::vec3(object_scale[0], object_scale[1], object_scale[2]));
 
-	const glm::mat4 view = glm::lookAt(
-		glm::vec3(2.0f, 1.5f, 2.0f),
-		glm::vec3(0.0f, 0.0f, 0.0f),
-		glm::vec3(0.0f, 1.0f, 0.0f));
+	const glm::mat4 view = viewMatrix();
 
 	glm::mat4 projection;
 	if (use_perspective_projection) {
