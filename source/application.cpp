@@ -137,21 +137,31 @@ VmaAllocation index_buffer_allocation;
 VkPipelineLayout pipeline_layout;
 VkPipeline pipeline;
 
-// то, что раньше называлось PushConstants, теперь лежит в uniform-буфере
-// и привязывается через дескрипторы — так же, как показано в лекции про
-// descriptors and buffers
-struct GlobalUniforms {
-	glm::mat4 mvp;
+// ЛР2 (доп. задание 1): данные разделены на два набора дескрипторов.
+// set = 0 — общие данные сцены (одинаковые для всех объектов)
+struct SceneUniforms {
+	glm::mat4 view_projection;
+};
+
+// set = 1 — данные конкретной модели
+struct ModelUniforms {
+	glm::mat4 model;
 	glm::vec4 tint;
 };
 
-VkBuffer uniform_buffer;
-VmaAllocation uniform_buffer_allocation;
-void* uniform_buffer_mapped;
+VkBuffer scene_uniform_buffer;
+VmaAllocation scene_uniform_buffer_allocation;
+void* scene_uniform_buffer_mapped;
 
-VkDescriptorSetLayout descriptor_set_layout;
+VkBuffer model_uniform_buffer;
+VmaAllocation model_uniform_buffer_allocation;
+void* model_uniform_buffer_mapped;
+
+VkDescriptorSetLayout scene_set_layout;
+VkDescriptorSetLayout model_set_layout;
 VkDescriptorPool descriptor_pool;
-VkDescriptorSet descriptor_set;
+VkDescriptorSet scene_descriptor_set;
+VkDescriptorSet model_descriptor_set;
 
 std::vector<char> readFile(const char* path) {
 	std::ifstream file(path, std::ios::ate | std::ios::binary);
@@ -302,45 +312,69 @@ bool initialize() {
 		return false;
 	}
 
-	// uniform-буфер под матрицу и цвет — данные не задаём сразу, будем
-	// перезаписывать его каждый кадр в render()
-	if (!createBuffer(context.allocator, sizeof(GlobalUniforms),
-					   VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, uniform_buffer,
-					   uniform_buffer_allocation, nullptr, &uniform_buffer_mapped)) {
+		// два uniform-буфера: для сцены и для модели. Данные не задаём сразу,
+	// будем перезаписывать их каждый кадр в render()
+	if (!createBuffer(context.allocator, sizeof(SceneUniforms),
+					   VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, scene_uniform_buffer,
+					   scene_uniform_buffer_allocation, nullptr, &scene_uniform_buffer_mapped)) {
 		return false;
 	}
 
-	// описываем, что дескриптор под binding = 0 — это один uniform-буфер,
-	// видимый и вершинному, и фрагментному шейдеру
-	const VkDescriptorSetLayoutBinding descriptor_binding = {
+	if (!createBuffer(context.allocator, sizeof(ModelUniforms),
+					   VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, model_uniform_buffer,
+					   model_uniform_buffer_allocation, nullptr, &model_uniform_buffer_mapped)) {
+		return false;
+	}
+
+	// раскладка set = 0 (сцена): binding 0 — uniform-буфер сцены
+	const VkDescriptorSetLayoutBinding scene_binding = {
 		.binding = 0,
 		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 		.descriptorCount = 1,
 		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 	};
 
-	const VkDescriptorSetLayoutCreateInfo descriptor_set_layout_info = {
+	const VkDescriptorSetLayoutCreateInfo scene_layout_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
 		.bindingCount = 1,
-		.pBindings = &descriptor_binding,
+		.pBindings = &scene_binding,
 	};
 
-	if (vkCreateDescriptorSetLayout(context.device, &descriptor_set_layout_info, nullptr,
-									&descriptor_set_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create descriptor set layout\n";
+	if (vkCreateDescriptorSetLayout(context.device, &scene_layout_info, nullptr,
+									&scene_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create scene descriptor set layout\n";
 		return false;
 	}
 
-	// пул, из которого будет выделен ровно один набор с одним
-	// uniform-буфером внутри (N=1 дескриптор на тип * S=1 набор)
+	// раскладка set = 1 (модель): binding 0 — uniform-буфер модели
+	const VkDescriptorSetLayoutBinding model_binding = {
+		.binding = 0,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+	};
+
+	const VkDescriptorSetLayoutCreateInfo model_layout_info = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = 1,
+		.pBindings = &model_binding,
+	};
+
+	if (vkCreateDescriptorSetLayout(context.device, &model_layout_info, nullptr,
+									&model_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create model descriptor set layout\n";
+		return false;
+	}
+
+	// пул: 2 набора, в них всего 2 uniform-буфера
 	const VkDescriptorPoolSize descriptor_pool_size = {
 		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = 1,
+		.descriptorCount = 2,
 	};
 
 	const VkDescriptorPoolCreateInfo descriptor_pool_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.maxSets = 1,
+		.maxSets = 2,
 		.poolSizeCount = 1,
 		.pPoolSizes = &descriptor_pool_size,
 	};
@@ -351,38 +385,59 @@ bool initialize() {
 		return false;
 	}
 
+	// выделяем сразу оба набора: каждый по своей раскладке
+	const VkDescriptorSetLayout set_layouts[] = { scene_set_layout, model_set_layout };
+	VkDescriptorSet allocated_sets[2];
+
 	const VkDescriptorSetAllocateInfo descriptor_set_alloc_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
 		.descriptorPool = descriptor_pool,
-		.descriptorSetCount = 1,
-		.pSetLayouts = &descriptor_set_layout,
+		.descriptorSetCount = 2,
+		.pSetLayouts = set_layouts,
 	};
 
 	if (vkAllocateDescriptorSets(context.device, &descriptor_set_alloc_info,
-								 &descriptor_set) != VK_SUCCESS) {
-		std::cerr << "Failed to allocate descriptor set\n";
+								 allocated_sets) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate descriptor sets\n";
 		return false;
 	}
 
-	// привязываем наш uniform-буфер к дескриптору набора: буфер не
-	// меняется, поэтому этого достаточно сделать один раз здесь, а не
-	// каждый кадр — меняться будет только содержимое буфера
-	const VkDescriptorBufferInfo descriptor_buffer_info = {
-		.buffer = uniform_buffer,
+	scene_descriptor_set = allocated_sets[0];
+	model_descriptor_set = allocated_sets[1];
+
+	// привязываем буферы к наборам (один раз: меняться будет только содержимое)
+	const VkDescriptorBufferInfo scene_buffer_info = {
+		.buffer = scene_uniform_buffer,
 		.offset = 0,
-		.range = sizeof(GlobalUniforms),
+		.range = sizeof(SceneUniforms),
 	};
 
-	const VkWriteDescriptorSet write_descriptor_set = {
-		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-		.dstSet = descriptor_set,
-		.dstBinding = 0,
-		.descriptorCount = 1,
-		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.pBufferInfo = &descriptor_buffer_info,
+	const VkDescriptorBufferInfo model_buffer_info = {
+		.buffer = model_uniform_buffer,
+		.offset = 0,
+		.range = sizeof(ModelUniforms),
 	};
 
-	vkUpdateDescriptorSets(context.device, 1, &write_descriptor_set, 0, nullptr);
+	const VkWriteDescriptorSet descriptor_writes[] = {
+		{
+			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			.dstSet = scene_descriptor_set,
+			.dstBinding = 0,
+			.descriptorCount = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.pBufferInfo = &scene_buffer_info,
+		},
+		{
+			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			.dstSet = model_descriptor_set,
+			.dstBinding = 0,
+			.descriptorCount = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.pBufferInfo = &model_buffer_info,
+		},
+	};
+
+	vkUpdateDescriptorSets(context.device, 2, descriptor_writes, 0, nullptr);
 
 	const VkShaderModule vert_module = loadShaderModule(context.device, "shaders/cone.vert.spv");
 	const VkShaderModule frag_module = loadShaderModule(context.device, "shaders/cone.frag.spv");
@@ -496,8 +551,8 @@ bool initialize() {
 
 	const VkPipelineLayoutCreateInfo pipeline_layout_info = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.setLayoutCount = 1,
-		.pSetLayouts = &descriptor_set_layout,
+		.setLayoutCount = 2,
+		.pSetLayouts = set_layouts, // set 0 — сцена, set 1 — модель
 	};
 
 	if (vkCreatePipelineLayout(context.device, &pipeline_layout_info, nullptr,
@@ -546,10 +601,12 @@ void shutdown() {
 
 	// уничтожение пула дескрипторов освобождает и выделенный из него
 	// descriptor_set — отдельно его уничтожать не нужно
-	vkDestroyDescriptorPool(context.device, descriptor_pool, nullptr);
-	vkDestroyDescriptorSetLayout(context.device, descriptor_set_layout, nullptr);
+		vkDestroyDescriptorPool(context.device, descriptor_pool, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, model_set_layout, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, scene_set_layout, nullptr);
 
-	vmaDestroyBuffer(context.allocator, uniform_buffer, uniform_buffer_allocation);
+	vmaDestroyBuffer(context.allocator, model_uniform_buffer, model_uniform_buffer_allocation);
+	vmaDestroyBuffer(context.allocator, scene_uniform_buffer, scene_uniform_buffer_allocation);
 	vmaDestroyBuffer(context.allocator, index_buffer, index_buffer_allocation);
 	vmaDestroyBuffer(context.allocator, vertex_buffer, vertex_buffer_allocation);
 }
@@ -720,17 +777,23 @@ void render(const graphics::internal::FrameData& fd) {
 	// Vulkan's clip space has Y pointing down, unlike OpenGL's.
 	projection[1][1] *= -1.0f;
 
-	// каждый кадр пересчитываем значения и обновляем память на GPU —
-	// буфер уже смаппен с момента создания, поэтому просто memcpy
-	const GlobalUniforms global_uniforms = {
-		.mvp = projection * view * model,
+	
+	// каждый кадр обновляем оба uniform-буфера
+	const SceneUniforms scene_uniforms = {
+		.view_projection = projection * view,
+	};
+	std::memcpy(scene_uniform_buffer_mapped, &scene_uniforms, sizeof(SceneUniforms));
+
+	const ModelUniforms model_uniforms = {
+		.model = model,
 		.tint = { object_tint[0], object_tint[1], object_tint[2], object_tint[3] },
 	};
-	std::memcpy(uniform_buffer_mapped, &global_uniforms, sizeof(GlobalUniforms));
+	std::memcpy(model_uniform_buffer_mapped, &model_uniforms, sizeof(ModelUniforms));
 
+	// привязываем оба набора сразу: set 0 — сцена, set 1 — модель
+	const VkDescriptorSet descriptor_sets[] = { scene_descriptor_set, model_descriptor_set };
 	vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
-							0, 1, &descriptor_set, 0, nullptr);
-
+							0, 2, descriptor_sets, 0, nullptr);
 	vkCmdDrawIndexed(fd.command_buffer, uint32_t(indices.size()), 1, 0, 0, 0);
 
 	vkCmdEndRenderPass(fd.command_buffer);
