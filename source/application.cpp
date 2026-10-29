@@ -179,6 +179,28 @@ VkDescriptorPool descriptor_pool;
 VkDescriptorSet scene_descriptor_set;
 VkDescriptorSet model_descriptor_set;
 
+
+// ЛР2 (доп. задание 2): точечные источники.
+// Эта же структура лежит в storage-буфере, раскладка как std430 в шейдере.
+struct PointLight {
+	glm::vec3 position;
+	float intensity;
+	glm::vec3 color;
+	float _pad;
+};
+
+std::vector<PointLight> point_lights = {
+	{ .position = { 1.0f, 1.0f, 1.0f }, .intensity = 1.5f, .color = { 1.0f, 0.3f, 0.2f }, ._pad = 0.0f },
+	{ .position = { -1.0f, 0.8f, -0.5f }, .intensity = 1.5f, .color = { 0.2f, 0.5f, 1.0f }, ._pad = 0.0f },
+};
+
+// storage-буфер с массивом точечных источников (set 0, binding 1).
+// Ёмкость растёт, когда источников становится больше, чем помещается.
+VkBuffer point_light_buffer = VK_NULL_HANDLE;
+VmaAllocation point_light_buffer_allocation;
+void* point_light_buffer_mapped;
+size_t point_light_capacity = 0;
+
 std::vector<char> readFile(const char* path) {
 	std::ifstream file(path, std::ios::ate | std::ios::binary);
 	if (!file.is_open()) {
@@ -323,6 +345,60 @@ glm::vec3 material_specular = { 1.0f, 1.0f, 1.0f };
 float material_shininess = 32.0f;
 bool use_vertex_color = true; // процедурный цвет из ЛР1
 
+
+// Привязывает storage-буфер к набору дескрипторов сцены (set 0) на указанный binding
+void writeStorageDescriptor(VkBuffer buffer, uint32_t binding) {
+	const VkDescriptorBufferInfo buffer_info = {
+		.buffer = buffer,
+		.offset = 0,
+		.range = VK_WHOLE_SIZE,
+	};
+
+	const VkWriteDescriptorSet write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = scene_descriptor_set,
+		.dstBinding = binding,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		.pBufferInfo = &buffer_info,
+	};
+
+	vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
+}
+
+// Если элементов больше, чем помещается в буфер, пересоздаёт буфер
+// с удвоенной ёмкостью и заново привязывает его к дескриптору.
+// Вызывается в render(): prepare() к этому моменту уже дождался конца
+// прошлого кадра, поэтому GPU старый буфер больше не использует.
+bool ensureStorageCapacity(VkBuffer& buffer, VmaAllocation& allocation, void*& mapped,
+						   size_t& capacity, size_t count, size_t element_size, uint32_t binding) {
+	if (count <= capacity) {
+		return true;
+	}
+
+	size_t new_capacity = std::max<size_t>(capacity, 4);
+	while (new_capacity < count) {
+		new_capacity *= 2;
+	}
+
+	auto& context = graphics::internal::context;
+	if (buffer != VK_NULL_HANDLE) {
+		vmaDestroyBuffer(context.allocator, buffer, allocation);
+		buffer = VK_NULL_HANDLE;
+	}
+
+	if (!createBuffer(context.allocator, new_capacity * element_size,
+					   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, buffer, allocation, nullptr, &mapped)) {
+		capacity = 0;
+		return false;
+	}
+
+	capacity = new_capacity;
+	writeStorageDescriptor(buffer, binding);
+	return true;
+}
+
+
 } // namespace
 
 bool initialize() {
@@ -356,18 +432,28 @@ bool initialize() {
 		return false;
 	}
 
-	// раскладка set = 0 (сцена): binding 0 — uniform-буфер сцены
-	const VkDescriptorSetLayoutBinding scene_binding = {
-		.binding = 0,
-		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = 1,
-		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+		// раскладка set = 0 (сцена):
+	//   binding 0 — uniform-буфер сцены
+	//   binding 1 — storage-буфер с точечными источниками
+	const VkDescriptorSetLayoutBinding scene_bindings[] = {
+		{
+			.binding = 0,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+		{
+			.binding = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
 	};
 
 	const VkDescriptorSetLayoutCreateInfo scene_layout_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		.bindingCount = 1,
-		.pBindings = &scene_binding,
+		.bindingCount = sizeof(scene_bindings) / sizeof(scene_bindings[0]),
+		.pBindings = scene_bindings,
 	};
 
 	if (vkCreateDescriptorSetLayout(context.device, &scene_layout_info, nullptr,
@@ -396,17 +482,17 @@ bool initialize() {
 		return false;
 	}
 
-	// пул: 2 набора, в них всего 2 uniform-буфера
-	const VkDescriptorPoolSize descriptor_pool_size = {
-		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = 2,
+		// пул: 2 набора, в них всего 2 uniform-буфера и 1 storage-буфер
+	const VkDescriptorPoolSize descriptor_pool_sizes[] = {
+		{ .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 2 },
+		{ .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 },
 	};
 
 	const VkDescriptorPoolCreateInfo descriptor_pool_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
 		.maxSets = 2,
-		.poolSizeCount = 1,
-		.pPoolSizes = &descriptor_pool_size,
+		.poolSizeCount = sizeof(descriptor_pool_sizes) / sizeof(descriptor_pool_sizes[0]),
+		.pPoolSizes = descriptor_pool_sizes,
 	};
 
 	if (vkCreateDescriptorPool(context.device, &descriptor_pool_info, nullptr,
@@ -469,6 +555,13 @@ bool initialize() {
 
 	vkUpdateDescriptorSets(context.device, 2, descriptor_writes, 0, nullptr);
 
+	// первый storage-буфер для точечных источников (минимум на 4 штуки,
+	// чтобы дескриптор был валиден, даже если источников нет)
+	if (!ensureStorageCapacity(point_light_buffer, point_light_buffer_allocation,
+							   point_light_buffer_mapped, point_light_capacity,
+							   std::max<size_t>(point_lights.size(), 1), sizeof(PointLight), 1)) {
+		return false;
+	}
 	const VkShaderModule vert_module = loadShaderModule(context.device, "shaders/cone.vert.spv");
 	const VkShaderModule frag_module = loadShaderModule(context.device, "shaders/cone.frag.spv");
 	if (vert_module == VK_NULL_HANDLE || frag_module == VK_NULL_HANDLE) {
@@ -631,10 +724,11 @@ void shutdown() {
 
 	// уничтожение пула дескрипторов освобождает и выделенный из него
 	// descriptor_set — отдельно его уничтожать не нужно
-		vkDestroyDescriptorPool(context.device, descriptor_pool, nullptr);
+	vkDestroyDescriptorPool(context.device, descriptor_pool, nullptr);
 	vkDestroyDescriptorSetLayout(context.device, model_set_layout, nullptr);
 	vkDestroyDescriptorSetLayout(context.device, scene_set_layout, nullptr);
 
+	vmaDestroyBuffer(context.allocator, point_light_buffer, point_light_buffer_allocation);
 	vmaDestroyBuffer(context.allocator, model_uniform_buffer, model_uniform_buffer_allocation);
 	vmaDestroyBuffer(context.allocator, scene_uniform_buffer, scene_uniform_buffer_allocation);
 	vmaDestroyBuffer(context.allocator, index_buffer, index_buffer_allocation);
@@ -712,6 +806,34 @@ void update(double time) {
 	}
 	ImGui::ColorEdit3("Light color", &directional_light_color.x);
 	ImGui::SliderFloat("Light intensity", &directional_light_intensity, 0.0f, 3.0f);
+
+		ImGui::SeparatorText("Point lights");
+	if (ImGui::Button("Add point light")) {
+		point_lights.push_back({ .position = { 0.0f, 1.0f, 1.0f }, .intensity = 1.0f,
+								 .color = { 1.0f, 1.0f, 1.0f }, ._pad = 0.0f });
+	}
+	ImGui::SameLine();
+	ImGui::Text("count: %zu", point_lights.size());
+
+	int point_light_to_remove = -1;
+	for (size_t i = 0; i < point_lights.size(); ++i) {
+		PointLight& light = point_lights[i];
+		ImGui::PushID(int(i)); // чтобы у одинаковых слайдеров разных источников были разные ID
+		if (ImGui::TreeNode("point", "Point light #%zu", i)) {
+			ImGui::DragFloat3("Position", &light.position.x, 0.02f);
+			ImGui::ColorEdit3("Color", &light.color.x);
+			ImGui::SliderFloat("Intensity", &light.intensity, 0.0f, 10.0f);
+			if (ImGui::Button("Remove")) {
+				point_light_to_remove = int(i);
+			}
+			ImGui::TreePop();
+		}
+		ImGui::PopID();
+	}
+	// удаляем после цикла, чтобы не портить перебор массива
+	if (point_light_to_remove >= 0) {
+		point_lights.erase(point_lights.begin() + point_light_to_remove);
+	}
 
 	ImGui::SeparatorText("Transform");
 	ImGui::BeginDisabled(animation_enabled);
@@ -833,7 +955,7 @@ void render(const graphics::internal::FrameData& fd) {
 	const SceneUniforms scene_uniforms = {
 		.view_projection = projection * view,
 		.camera_position = camera_position,
-		.point_light_count = 0,
+		.point_light_count = uint32_t(point_lights.size()),
 		.directional_light_direction = directional_light_direction,
 		.spot_light_count = 0,
 		.directional_light_color = directional_light_enabled
@@ -843,7 +965,18 @@ void render(const graphics::internal::FrameData& fd) {
 		.ambient_light = ambient_color * ambient_intensity,
 		._pad1 = 0.0f,
 	};
+	
 	std::memcpy(scene_uniform_buffer_mapped, &scene_uniforms, sizeof(SceneUniforms));
+
+
+	// точечные источники: при необходимости увеличиваем буфер и копируем массив
+	ensureStorageCapacity(point_light_buffer, point_light_buffer_allocation,
+						  point_light_buffer_mapped, point_light_capacity,
+						  std::max<size_t>(point_lights.size(), 1), sizeof(PointLight), 1);
+	if (!point_lights.empty()) {
+		std::memcpy(point_light_buffer_mapped, point_lights.data(),
+					point_lights.size() * sizeof(PointLight));
+	}
 
 	const ModelUniforms model_uniforms = {
 		.model = model,

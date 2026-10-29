@@ -27,6 +27,20 @@ layout(std140, set = 1, binding = 0) uniform ModelUniforms {
 	uint use_vertex_color;
 } model_uniforms;
 
+
+// Точечный источник (доп. задание 2). Раскладка std430 совпадает с C++.
+struct PointLight {
+	vec3 position;
+	float intensity;
+	vec3 color;
+};
+
+// storage-буфер: размер массива в шейдере не задан,
+// реальное количество — scene.point_light_count
+layout(std430, set = 0, binding = 1) readonly buffer PointLights {
+	PointLight point_lights[];
+};
+
 // Модель Блинн-Фонга для одного источника:
 //   L = (rho_d + rho_s * max(n·h, 0)^shininess) * max(n·l, 0) * E_L
 // n — нормаль, v — направление на камеру, l — направление на источник,
@@ -63,7 +77,17 @@ void main() {
 	const vec3 l = normalize(-scene.directional_light_direction);
 	color += blinnPhong(base_color, n, v, l, scene.directional_light_color);
 
-	// здесь на шагах 5 и 6 добавятся циклы по точечным и прожекторным источникам
+	// точечные источники: затухание по закону обратных квадратов 1/d^2
+	for (uint i = 0; i < scene.point_light_count; ++i) {
+		const vec3 to_light = point_lights[i].position - in_world_position;
+		const float distance_squared = max(dot(to_light, to_light), 0.0001);
+		const vec3 l_point = to_light / sqrt(distance_squared);
+
+		const vec3 radiance = point_lights[i].color * point_lights[i].intensity / distance_squared;
+		color += blinnPhong(base_color, n, v, l_point, radiance);
+	}
+
 
 	out_frag_color = vec4(color, model_uniforms.albedo.a);
+
 }
