@@ -138,15 +138,31 @@ VkPipelineLayout pipeline_layout;
 VkPipeline pipeline;
 
 // ЛР2 (доп. задание 1): данные разделены на два набора дескрипторов.
+// Раскладка полей повторяет std140 в шейдере: vec3 занимает 16 байт,
+// поэтому после каждого vec3 кладём один float/uint, чтобы заполнить место.
+
 // set = 0 — общие данные сцены (одинаковые для всех объектов)
 struct SceneUniforms {
 	glm::mat4 view_projection;
+	glm::vec3 camera_position;
+	uint32_t point_light_count;          // понадобится на шаге 5
+	glm::vec3 directional_light_direction;
+	uint32_t spot_light_count;           // понадобится на шаге 6
+	glm::vec3 directional_light_color;   // цвет * интенсивность
+	float _pad0;
+	glm::vec3 ambient_light;             // цвет * интенсивность
+	float _pad1;
 };
 
-// set = 1 — данные конкретной модели
+// set = 1 — данные конкретной модели: матрицы и материал
 struct ModelUniforms {
 	glm::mat4 model;
-	glm::vec4 tint;
+	glm::mat4 normal_matrix;   // transpose(inverse(model)) — для нормалей
+	glm::vec4 albedo;          // цвет из ЛР1 (Tint) = альбедо материала
+	glm::vec3 specular;        // цвет блика
+	float shininess;           // коэффициент блеска
+	uint32_t use_vertex_color; // ЛР1, доп. №5: умножать ли на процедурный цвет вершин
+	uint32_t _pad[3];
 };
 
 VkBuffer scene_uniform_buffer;
@@ -292,6 +308,20 @@ glm::mat4 viewMatrix() {
 	v = glm::translate(v, -camera_position);
 	return v;
 }
+
+
+// ЛР2: освещение и материал (всё меняется из ImGui)
+glm::vec3 ambient_color = { 1.0f, 1.0f, 1.0f };
+float ambient_intensity = 0.1f;
+
+bool directional_light_enabled = true;
+glm::vec3 directional_light_direction = glm::normalize(glm::vec3(-0.5f, -1.0f, -0.3f)); // куда светит
+glm::vec3 directional_light_color = { 1.0f, 1.0f, 1.0f };
+float directional_light_intensity = 1.0f;
+
+glm::vec3 material_specular = { 1.0f, 1.0f, 1.0f };
+float material_shininess = 32.0f;
+bool use_vertex_color = true; // процедурный цвет из ЛР1
 
 } // namespace
 
@@ -660,8 +690,28 @@ void update(double time) {
 		ImGui::SliderFloat("Ortho size", &orthographic_size, 0.2f, 5.0f);
 	}
 
-	ImGui::SeparatorText("Color");
-	ImGui::ColorEdit4("Tint", object_tint);
+	ImGui::SeparatorText("Material (Blinn-Phong)");
+	ImGui::ColorEdit4("Albedo (Tint)", object_tint);
+	ImGui::Checkbox("Procedural vertex color", &use_vertex_color);
+	ImGui::ColorEdit3("Specular", &material_specular.x);
+	ImGui::SliderFloat("Shininess", &material_shininess, 1.0f, 256.0f, "%.1f",
+					   ImGuiSliderFlags_Logarithmic);
+
+	ImGui::SeparatorText("Ambient light");
+	ImGui::ColorEdit3("Ambient color", &ambient_color.x);
+	ImGui::SliderFloat("Ambient intensity", &ambient_intensity, 0.0f, 1.0f);
+
+	ImGui::SeparatorText("Directional light");
+	ImGui::Checkbox("Enabled", &directional_light_enabled);
+	if (ImGui::DragFloat3("Direction", &directional_light_direction.x, 0.01f, -1.0f, 1.0f)) {
+		// направление должно быть единичным вектором
+		if (glm::length(directional_light_direction) < 0.001f) {
+			directional_light_direction = { 0.0f, -1.0f, 0.0f };
+		}
+		directional_light_direction = glm::normalize(directional_light_direction);
+	}
+	ImGui::ColorEdit3("Light color", &directional_light_color.x);
+	ImGui::SliderFloat("Light intensity", &directional_light_intensity, 0.0f, 3.0f);
 
 	ImGui::SeparatorText("Transform");
 	ImGui::BeginDisabled(animation_enabled);
@@ -777,16 +827,32 @@ void render(const graphics::internal::FrameData& fd) {
 	// Vulkan's clip space has Y pointing down, unlike OpenGL's.
 	projection[1][1] *= -1.0f;
 
-	
+
 	// каждый кадр обновляем оба uniform-буфера
+		// каждый кадр обновляем оба uniform-буфера
 	const SceneUniforms scene_uniforms = {
 		.view_projection = projection * view,
+		.camera_position = camera_position,
+		.point_light_count = 0,
+		.directional_light_direction = directional_light_direction,
+		.spot_light_count = 0,
+		.directional_light_color = directional_light_enabled
+			? directional_light_color * directional_light_intensity
+			: glm::vec3(0.0f),
+		._pad0 = 0.0f,
+		.ambient_light = ambient_color * ambient_intensity,
+		._pad1 = 0.0f,
 	};
 	std::memcpy(scene_uniform_buffer_mapped, &scene_uniforms, sizeof(SceneUniforms));
 
 	const ModelUniforms model_uniforms = {
 		.model = model,
-		.tint = { object_tint[0], object_tint[1], object_tint[2], object_tint[3] },
+		.normal_matrix = glm::transpose(glm::inverse(model)),
+		.albedo = { object_tint[0], object_tint[1], object_tint[2], object_tint[3] },
+		.specular = material_specular,
+		.shininess = material_shininess,
+		.use_vertex_color = use_vertex_color ? 1u : 0u,
+		._pad = { 0, 0, 0 },
 	};
 	std::memcpy(model_uniform_buffer_mapped, &model_uniforms, sizeof(ModelUniforms));
 
